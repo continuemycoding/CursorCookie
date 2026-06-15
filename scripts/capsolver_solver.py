@@ -79,15 +79,17 @@ FAKE_TURNSTILE_JS = """
     } catch (e) {}
   };
 
+  window.__cfCalls = window.__cfCalls || [];
+  const note = (s) => { try { if (window.__cfCalls.length < 40) window.__cfCalls.push(s); } catch (e) {} };
   let _wid = 0;
   const fake = {
-    render: function (container, params) { record(container, params); return 'cf-fake-' + (++_wid); },
-    execute: function (container, params) { record(container, params); },
-    reset: function () {},
-    remove: function () {},
-    getResponse: function () { return window.__cfToken || ''; },
-    ready: function (cb) { try { if (typeof cb === 'function') cb(); } catch (e) {} },
-    isExpired: function () { return false; },
+    render: function (container, params) { note('render'); record(container, params); return 'cf-fake-' + (++_wid); },
+    execute: function (container, params) { note('execute'); record(container, params); },
+    reset: function () { note('reset'); },
+    remove: function () { note('remove'); },
+    getResponse: function () { note('getResponse'); return window.__cfToken || ''; },
+    ready: function (cb) { note('ready'); try { if (typeof cb === 'function') cb(); } catch (e) {} },
+    isExpired: function () { note('isExpired'); return false; },
   };
 
   try {
@@ -219,6 +221,8 @@ DIAGNOSE_SCRIPT = """
     responseInput: q('input[name="cf-turnstile-response"]'),
     contentSitekey: m ? m[0] : '',
     errors: (window.__cfErrors || []).slice(0, 12),
+    calls: (window.__cfCalls || []).slice(0, 20),
+    botTokenInput: q('input[name="bot_detection_token"]'),
   };
 }
 """
@@ -380,7 +384,9 @@ def diagnose(page) -> None:
                 f"cb={info.get('cbCount')} container={info.get('containerPresent')}/"
                 f"children={info.get('containerChildren')} "
                 f"respInput={info.get('responseInput')} "
+                f"botTokenInput={info.get('botTokenInput')} "
                 f"contentSitekey={info.get('contentSitekey') or '无'} "
+                f"calls={info.get('calls') or '无'} "
                 f"errors={info.get('errors') or '无'}"
             )
 
