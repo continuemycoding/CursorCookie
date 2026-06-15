@@ -367,7 +367,7 @@ def kick_render(page) -> str:
     main_result = ""
     for idx, frame in enumerate([page.main_frame, *page.frames]):
         result = _eval(frame, KICK_RENDER_SCRIPT)
-        if result and result not in ("already-rendered", "no-onload-callback"):
+        if idx == 0 or (result and result not in ("already-rendered", "no-onload-callback")):
             _log(f"[capsolver] kick frame#{idx}: {result}")
         if idx == 0:
             main_result = result or ""
@@ -546,6 +546,7 @@ def solve_when_present(page, *, label: str = "", wait_s: int = 8) -> bool:
                     page.wait_for_timeout(1500)
                 except Exception:
                     time.sleep(1.5)
+            diagnose(page)
             try:
                 token = solve_turnstile(
                     params["sitekey"],
