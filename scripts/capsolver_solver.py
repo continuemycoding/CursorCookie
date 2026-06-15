@@ -365,21 +365,27 @@ def diagnose(page) -> None:
 # 到底能不能通 / 返回了什么 / 是否被 CSP 拦执行。
 PROBE_APIJS_SCRIPT = """
 async () => {
-  const out = { csp: '' };
+  const out = { csp: '', before: typeof window.turnstile };
   try {
     const meta = document.querySelector('meta[http-equiv="Content-Security-Policy" i]');
-    out.csp = meta ? (meta.getAttribute('content') || '').slice(0, 200) : '';
+    out.csp = meta ? (meta.getAttribute('content') || '').slice(0, 160) : '';
   } catch (e) {}
+  // 真正执行一份干净的 api.js（无参数），看 window.turnstile 是否会出现。
   try {
-    const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/api.js',
-                          { method: 'GET', cache: 'no-store' });
-    const t = await r.text();
-    out.status = r.status;
-    out.len = t.length;
-    out.head = t.slice(0, 60).replace(/\\n/g, ' ');
-  } catch (e) {
-    out.error = String(e);
-  }
+    const ev = await new Promise((res) => {
+      const s = document.createElement('script');
+      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+      s.async = true;
+      s.onload = () => res('load');
+      s.onerror = () => res('error');
+      (document.head || document.documentElement).appendChild(s);
+      setTimeout(() => res('timeout'), 6000);
+    });
+    out.scriptEvent = ev;
+  } catch (e) { out.scriptEvent = 'exc:' + (e && e.message); }
+  await new Promise((r) => setTimeout(r, 2500));
+  out.afterTurnstile = typeof window.turnstile;
+  out.hasRender = !!(window.turnstile && typeof window.turnstile.render === 'function');
   return out;
 }
 """
@@ -397,13 +403,11 @@ def probe_apijs(page) -> None:
     if not info:
         _log("[capsolver] 网络探针：执行失败（无返回）")
         return
-    if info.get("error"):
-        _log(f"[capsolver] 网络探针：fetch api.js 失败 -> {info.get('error')} csp={info.get('csp') or '无'}")
-    else:
-        _log(
-            f"[capsolver] 网络探针：api.js status={info.get('status')} "
-            f"len={info.get('len')} head={info.get('head')!r} csp={info.get('csp') or '无'}"
-        )
+    _log(
+        f"[capsolver] 网络探针：执行干净 api.js -> scriptEvent={info.get('scriptEvent')} "
+        f"turnstile {info.get('before')}→{info.get('afterTurnstile')} "
+        f"hasRender={info.get('hasRender')} csp={info.get('csp') or '无'}"
+    )
 
 
 def kick_render(page) -> str:
