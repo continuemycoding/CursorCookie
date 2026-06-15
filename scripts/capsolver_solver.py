@@ -23,6 +23,7 @@ import json
 import os
 import re
 import time
+from urllib.parse import urlparse
 
 import requests
 
@@ -167,6 +168,44 @@ TURNSTILE_INJECT_SCRIPT = """
     try { cb(token); callbacks += 1; } catch (e) {}
   });
   return { fields, callbacks };
+}
+"""
+
+# 直接绕过 bot-check：实测该 CI 浏览器里 Cursor 的 bot-check 子树不会在客户端 hydrate
+# （window.onloadTurnstileCallback 永不定义、react-turnstile 的 render 永不调用、widget 容器
+# 始终为空），所以靠“等 widget 渲染→拿回调→注入 token”那条路走不通。
+#
+# 但 Cursor 的提交逻辑（反编译 BotCheckClient.guard）只看 FormData 里有没有
+# bot_detection_token：没有就 setState('pending') 拦下；有就直接执行真正的 server action
+# （magic-code 发码）。因此只要把 CapSolver 求到的合法 token 作为隐藏 input 塞进鉴权表单，
+# 再点 “Email sign-in code”，guard 读到 token 即放行、服务端 siteverify 通过、验证码发出。
+INJECT_BOT_TOKEN_SCRIPT = """
+(token) => {
+  window.__cfToken = token;
+  const forms = Array.from(document.querySelectorAll('form'));
+  const isAuth = (f) => f.querySelector(
+    'input[name="signals"], [name="intent"], input[name="email"], input[type="password"]'
+  );
+  let targets = forms.filter(isAuth);
+  if (targets.length === 0) targets = forms;
+  let injected = 0;
+  for (const f of targets) {
+    let inp = f.querySelector('input[name="bot_detection_token"]');
+    if (!inp) {
+      inp = document.createElement('input');
+      inp.type = 'hidden';
+      inp.name = 'bot_detection_token';
+      f.appendChild(inp);
+    }
+    inp.value = token;
+    injected += 1;
+  }
+  // 万一 widget 真的渲染过（捕获到了 React onSuccess 回调），也一并触发，等价于真实通过。
+  let callbacks = 0;
+  (window.__cfTurnstileCallbacks || []).forEach((cb) => {
+    try { cb(token); callbacks += 1; } catch (e) {}
+  });
+  return { injected, callbacks, forms: forms.length };
 }
 """
 
@@ -581,6 +620,72 @@ def inject_token(page, token: str) -> bool:
         return True
     _log("[capsolver] ❌ 未找到可注入的 response 字段/回调（token 无处可用）")
     return False
+
+
+def _action_from_url(url: str) -> str:
+    """Cursor 的 Turnstile action = pathname.replace(/[^a-zA-Z0-9]/g, '-')（见反编译 BotCheckClient）。"""
+    path = urlparse(url).path or "/"
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
+def inject_bot_token(page, token: str) -> bool:
+    """把 bot_detection_token 作为隐藏 input 塞进鉴权表单（绕过不渲染的 widget）。"""
+    total_injected = 0
+    total_cbs = 0
+    for frame in [page.main_frame, *page.frames]:
+        res = _eval(frame, INJECT_BOT_TOKEN_SCRIPT, token)
+        if res:
+            total_injected += res.get("injected", 0)
+            total_cbs += res.get("callbacks", 0)
+    if total_injected or total_cbs:
+        _log(
+            f"[capsolver] bot_detection_token 已注入：表单 {total_injected} 个，"
+            f"触发回调 {total_cbs} 个"
+        )
+        return True
+    _log("[capsolver] ❌ 未找到可注入的鉴权表单")
+    return False
+
+
+def solve_and_inject_bot_token(page, *, label: str = "", wait_s: int = 12) -> bool:
+    """检测 sitekey → CapSolver 求 token → 注入 bot_detection_token 到表单。
+
+    专用于 /password 页“发码”这一步：不依赖 widget 渲染，点按钮前先把 token 备好。
+    """
+    prefix = f"{label} " if label else ""
+    if not is_enabled():
+        _log(f"[capsolver] {prefix}⚠️ 未配置 CAPSOLVER_API_KEY，跳过求解")
+        return False
+
+    deadline = time.time() + wait_s
+    params = None
+    while time.time() < deadline:
+        ensure_fake_turnstile(page)
+        params = detect_turnstile(page)
+        if params:
+            break
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            time.sleep(1)
+
+    if not params:
+        _log(f"[capsolver] {prefix}{wait_s}s 内未检测到 Turnstile sitekey，无法求解")
+        return False
+
+    action = params.get("action") or _action_from_url(page.url)
+    _log(f"[capsolver] {prefix}开始求解（sitekey={params['sitekey']} action={action}）")
+    try:
+        token = solve_turnstile(
+            params["sitekey"],
+            params["url"],
+            action=action,
+            cdata=params.get("cdata", ""),
+        )
+    except (CapSolverError, requests.RequestException) as exc:
+        _log(f"[capsolver] {prefix}❌ 求解失败: {exc}")
+        return False
+    return inject_bot_token(page, token)
 
 
 def solve_when_present(page, *, label: str = "", wait_s: int = 8) -> bool:

@@ -370,65 +370,62 @@ def safe_body_text(page: Page, timeout_ms: int = 1000) -> str:
         return ""
 
 
-def wait_for_turnstile_pass(page: Page, budget: int = 45, *, attempt: int = 1) -> bool:
-    """点击 Email sign-in code 后用 CapSolver 通过 Turnstile，并确认进入下一步。
-
-    流程：CapSolver 求解并注入 token -> 轮询确认是否进入验证码页 / 离开 /password。
-    若注入后页面长时间不动，会在预算内重试 CapSolver（widget 可能被刷新重置）。
-    """
-    log(f"[login] 用 CapSolver 通过 Turnstile（第 {attempt} 次，预算 {budget}s）...")
-
-    if not capsolver_solver.is_enabled():
-        log("[login] ❌ 未配置 CAPSOLVER_API_KEY，无法自动通过 Turnstile")
-        return False
-
-    solve_turnstile(page, "等待阶段", wait_s=10)
-
-    deadline = time.time() + budget
+def wait_for_code_sent(page: Page, budget: int = 25) -> bool:
+    """点击发码后，确认验证码已发出（出现输入框 / 离开 /password / 页面提示已发送）。"""
     start = time.time()
+    deadline = start + budget
     last_log = 0.0
-    last_resolve = time.time()
-
     while time.time() < deadline:
-        now = time.time()
-        elapsed = now - start
-
         if is_on_code_input_page(page):
-            log(f"[login] ✅ 验证码输入框已出现（{elapsed:.1f}s）")
+            log(f"[login] ✅ 验证码输入框已出现（{time.time() - start:.1f}s）")
             return True
         if not is_password_url(page):
-            log(f"[login] ✅ 已离开 /password（{elapsed:.1f}s）: {page.url}")
+            log(f"[login] ✅ 已离开 /password（{time.time() - start:.1f}s）: {page.url}")
             return True
-
         body = safe_body_text(page)
-        if any(k in body for k in ("can't verify", "verify the user is human")):
-            log(f"[login] ❌ Turnstile 校验失败提示（{elapsed:.1f}s）")
-            return False
-        if any(k in body for k in ("验证码", "verification code", "check your email", "enter the code")):
-            log(f"[login] ✅ 页面提示已发送验证码（{elapsed:.1f}s）")
+        if any(
+            k in body
+            for k in ("check your email", "verification code", "enter the code", "验证码", "we sent", "sent you a")
+        ):
+            log(f"[login] ✅ 页面提示已发送验证码（{time.time() - start:.1f}s）")
             return True
-
-        # 注入后若 12s 仍无进展，重试一次 CapSolver（token 可能过期或 widget 已重置）
-        if now - last_resolve >= 12:
-            log(f"[login] {elapsed:.1f}s 仍无进展，重新调用 CapSolver 求解...")
-            solve_turnstile(page, f"重试({elapsed:.0f}s)", wait_s=6)
-            last_resolve = time.time()
-
+        if any(k in body for k in ("can't verify", "verify the user is human")):
+            log(f"[login] ❌ bot-check 校验失败提示（{time.time() - start:.1f}s）")
+            return False
+        now = time.time()
         if now - last_log >= 3:
             log(
-                f"[login] 等待中... {elapsed:.1f}s/{budget}s "
+                f"[login] 等待发码... {now - start:.1f}s/{budget}s "
                 f"url={page.url} body={body.replace(chr(10), ' ')[:70]}"
             )
             last_log = now
-
         page.wait_for_timeout(500)
-
-    log(f"[login] ⏰ Turnstile 等待超时（{budget}s），仍在 /password")
     return False
 
 
+def send_email_code_with_token(page: Page, attempt: int) -> bool:
+    """发码核心：求 token → 注入 bot_detection_token → 点 Email sign-in code → 等发码。
+
+    Cursor 的 bot-check 子树在该 CI 浏览器里不会客户端 hydrate（widget 永不渲染），
+    所以不走“等 widget→拿回调”，而是直接把合法 token 塞进表单绕过 guard 的 token 检查。
+    """
+    injected = capsolver_solver.solve_and_inject_bot_token(
+        page, label=f"密码页(第{attempt}次)", wait_s=12
+    )
+    if not injected:
+        log(f"[login] 第 {attempt} 次未能注入 bot_detection_token，仍尝试点击发码")
+
+    if not click_email_code_button(page):
+        save_debug(page, "email-code-button-missing")
+        raise TimeoutError(
+            "密码页未找到 Email sign-in code 按钮。请查看 debug/email-code-button-missing.png"
+        )
+    save_debug(page, f"after-email-code-click-{attempt}")
+    return wait_for_code_sent(page, budget=25)
+
+
 def choose_email_code_login(page: Page) -> None:
-    """Submit email 后通过 Email sign-in code 的 Turnstile，进入验证码输入页。"""
+    """Submit email 后触发 Email sign-in code 发码（注入 bot_detection_token 绕过 bot-check）。"""
     page.wait_for_timeout(800)
 
     if is_on_code_input_page(page):
@@ -438,8 +435,10 @@ def choose_email_code_login(page: Page) -> None:
         page, ['input[type="password"]'], timeout_ms=1500
     )
     if not on_password_page:
+        # 邮箱页直出发码入口的情形：同样先备好 token 再点。
+        capsolver_solver.solve_and_inject_bot_token(page, label="发码前", wait_s=8)
         if click_email_code_button(page):
-            wait_for_turnstile_pass(page, budget=45, attempt=1)
+            wait_for_code_sent(page, budget=25)
             save_debug(page, "after-email-code-click")
         if is_on_code_input_page(page):
             return
@@ -447,21 +446,15 @@ def choose_email_code_login(page: Page) -> None:
         log("[login] 提交邮箱后未进入验证码流程，继续等待验证码输入框...")
         return
 
-    log("[login] 进入密码页，准备点击 Email sign-in code 触发验证码")
-    max_attempts = 2
+    log("[login] 进入密码页，准备发码（注入 bot_detection_token 绕过 bot-check）")
+    max_attempts = 3
     for attempt in range(1, max_attempts + 1):
-        if not click_email_code_button(page):
-            save_debug(page, "email-code-button-missing")
-            raise TimeoutError(
-                "密码页未找到 Email sign-in code 按钮。请查看 debug/email-code-button-missing.png"
-            )
-        save_debug(page, f"after-email-code-click-{attempt}")
-        if wait_for_turnstile_pass(page, budget=45, attempt=attempt):
+        if send_email_code_with_token(page, attempt):
             log("[login] 已进入验证码流程")
             return
-        log(f"[login] 第 {attempt}/{max_attempts} 次未通过 Turnstile")
+        log(f"[login] 第 {attempt}/{max_attempts} 次未发出验证码")
         if attempt < max_attempts:
-            log("[login] 刷新页面重置 Turnstile 后重试...")
+            log("[login] 刷新页面后重试...")
             try:
                 page.reload(wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(random.randint(1200, 2200))
@@ -470,7 +463,7 @@ def choose_email_code_login(page: Page) -> None:
 
     save_debug(page, "still-on-password-after-code-click")
     raise TimeoutError(
-        "多次点击 Email sign-in code 后仍停留在 /password（Turnstile 未通过）。"
+        "多次尝试发码后仍停留在 /password（bot-check 未通过）。"
         "请查看 debug/still-on-password-after-code-click.png"
     )
 
