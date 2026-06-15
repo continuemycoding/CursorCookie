@@ -447,6 +447,13 @@ def choose_email_code_login(page: Page) -> None:
         return
 
     log("[login] 进入密码页，准备发码（注入 bot_detection_token 绕过 bot-check）")
+    # 密码页是 SPA 跳转过来的，Turnstile sitekey 只存在于 React props、不在 outerHTML 里，
+    # 正则扫不到。整页 reload 一次让 RSC 注水数据（含 siteKey:"0x4...") 落进 HTML，便于检测。
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(random.randint(1200, 2200))
+    except Exception as exc:
+        log(f"[login] 初次刷新失败: {exc}")
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         if send_email_code_with_token(page, attempt):
